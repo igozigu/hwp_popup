@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("Aside Browser HWP Security Popup Permanent Resolver & 3-Layer Auto-Approval Guard")]
 [assembly: AssemblyCompany("AsideHwpGuard")]
 [assembly: AssemblyProduct("hwp_popup")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 namespace AsideHwpGuard
 {
@@ -26,21 +26,23 @@ namespace AsideHwpGuard
     {
         // Constants & Paths
         public const string MutexName = @"Global\AsideHwpGuard_Mutex";
+        public const string ReadyEventName = @"Global\AsideHwpGuard_Ready_v1";
         public const string RunRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         public const string RunValueName = "AsideHwpGuard";
         public const string HwpModulesRegPath = @"Software\HNC\HwpAutomation\Modules";
         public const string HwpModulesWow64RegPath = @"Software\WOW6432Node\HNC\HwpAutomation\Modules";
         public const string EmbeddedDllResourceName = "FilePathCheckerModuleExample.dll";
+        public const string GuardModuleKey = "AsideHwpGuard_FilePathChecker_v1";
 
-        public static readonly string[] StandardModuleKeys = new string[]
+        // Existing aliases belong to their current owner, including broken values.
+        public static readonly string[] CompatibilityModuleKeys = new string[]
         {
             "FilePathCheckerModuleExample",
             "FilePathCheckerModule",
             "FilePathCheckDLL",
             "FilePathCheckDLLModule",
             "SecurityModule",
-            "Automation",
-            "AsideHwpSetup_v1"
+            "Automation"
         };
 
         public const string AgentsMarkerBegin = "<!-- ASIDE-HWP-GUARD:BEGIN -->";
@@ -53,13 +55,13 @@ namespace AsideHwpGuard
             "- **PowerShell 필수 패턴:**\r\n" +
             "  ```powershell\r\n" +
             "  $h = New-Object -ComObject HWPFrame.HwpObject\r\n" +
-            "  [void]$h.RegisterModule(\"FilePathCheckDLL\", \"FilePathCheckerModule\")\r\n" +
+            "  [void]$h.RegisterModule(\"FilePathCheckDLL\", \"AsideHwpGuard_FilePathChecker_v1\")\r\n" +
             "  [void]$h.SetMessageBoxMode(0x00020000)\r\n" +
             "  ```\r\n" +
             "- **Python 필수 패턴:**\r\n" +
             "  ```python\r\n" +
             "  hwp = win32com.client.Dispatch(\"HWPFrame.HwpObject\")\r\n" +
-            "  hwp.RegisterModule(\"FilePathCheckDLL\", \"FilePathCheckerModule\")\r\n" +
+            "  hwp.RegisterModule(\"FilePathCheckDLL\", \"AsideHwpGuard_FilePathChecker_v1\")\r\n" +
             "  hwp.SetMessageBoxMode(0x00020000)\r\n" +
             "  ```\r\n" +
             "<!-- ASIDE-HWP-GUARD:END -->";
@@ -101,6 +103,7 @@ namespace AsideHwpGuard
 
         private static volatile bool _daemonRunning = true;
         private static Mutex _instanceMutex = null;
+        private static EventWaitHandle _daemonReady = null;
         private static NotifyIcon _trayIcon = null;
         private static readonly object _logLock = new object();
         private static readonly Dictionary<IntPtr, DateTime> _recentlyClicked = new Dictionary<IntPtr, DateTime>();
@@ -111,6 +114,12 @@ namespace AsideHwpGuard
 
         [DllImport("kernel32.dll")]
         private static extern bool FreeConsole();
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CommandLineToArgvW(string commandLine, out int argumentCount);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr memory);
 
         [DllImport("kernel32.dll")]
         private static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
@@ -233,7 +242,7 @@ namespace AsideHwpGuard
                 // 1. Copy executable to %LocalAppData%\AsideHwpGuard\hwp_popup.exe and AsideHwpGuard.exe
                 CopySelfToInstallDir();
 
-                // 2. Layer 1: Extract DLL & Register 7 keys + repair broken paths
+                // 2. Layer 1: Extract DLL, repair our private key, fill missing aliases
                 ApplyLayer1();
 
                 // 3. Layer 2: Non-destructive AGENTS.md patch
@@ -249,18 +258,19 @@ namespace AsideHwpGuard
                     string daemonArg = showNotification ? "--daemon-notify" : "--daemon";
                     StartDaemonDetached(targetExe, daemonArg);
 
-                    // Wait up to 2.5s for mutex acquisition
-                    for (int i = 0; i < 25; i++)
+                    // The mutex is acquired before initialization. Wait for actual
+                    // readiness so an initialization failure cannot report success.
+                    for (int i = 0; i < 100; i++)
                     {
                         Thread.Sleep(100);
-                        if (IsDaemonRunning()) break;
+                        if (IsDaemonReady()) break;
                     }
                 }
-                else if (showNotification)
+                else if (showNotification && IsDaemonReady())
                 {
                     MessageBox.Show(
                         "Aside 한글 보안 팝업 해결 및 자동 가드가 활성화되어 실행 중입니다.\r\n\r\n" +
-                        "- Layer 1: 보안모듈 DLL 및 레지스트리 7종 등록 완료\r\n" +
+                        "- Layer 1: 전용 보안모듈 등록 완료, 기존 타 프로그램 등록 보존\r\n" +
                         "- Layer 2: AGENTS.md 보안모듈 지침 패치 완료\r\n" +
                         "- Layer 3: 백그라운드 보안 팝업 자동 승인 가드 작동 중",
                         "AsideHwpGuard (hwp_popup)",
@@ -268,6 +278,8 @@ namespace AsideHwpGuard
                         MessageBoxIcon.Information);
                 }
 
+                if (!IsDaemonReady())
+                    throw new InvalidOperationException("The installed guard daemon did not become ready; inspect guard.log and run setup again.");
                 WriteLog("INSTALL", string.Format("Setup & Layer 1/2 applied successfully (silent={0}).", !showNotification));
                 return 0;
             }
@@ -275,6 +287,9 @@ namespace AsideHwpGuard
             {
                 WriteLog("ERROR", "RunInstallAndStartLauncher failed: " + ex.Message);
                 Console.Error.WriteLine("[ERROR] " + ex.Message);
+                if (showNotification)
+                    MessageBox.Show("설치 또는 업데이트를 완료하지 못했습니다.\r\n\r\n" + ex.Message,
+                        "AsideHwpGuard 설치 오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return 1;
             }
         }
@@ -318,23 +333,82 @@ namespace AsideHwpGuard
         private static void CopySelfToInstallDir()
         {
             string currentExe = Assembly.GetExecutingAssembly().Location;
-            if (string.IsNullOrEmpty(currentExe) || !File.Exists(currentExe)) return;
+            if (string.IsNullOrEmpty(currentExe) || !File.Exists(currentExe))
+                throw new FileNotFoundException("Cannot locate the setup executable.", currentExe);
 
+            string expectedHash = ComputeFileSha256(currentExe);
             string[] targets = new string[] { InstalledPrimaryExePath, InstalledAliasExePath };
+            bool needsUpdate = false;
             foreach (string target in targets)
             {
-                try
+                if (!File.Exists(target) || !string.Equals(expectedHash, ComputeFileSha256(target), StringComparison.OrdinalIgnoreCase))
+                    needsUpdate = true;
+            }
+            if (needsUpdate && IsDaemonRunning()) StopOwnedDaemonsForUpgrade();
+
+            foreach (string target in targets)
+            {
+                if (File.Exists(target) && string.Equals(expectedHash, ComputeFileSha256(target), StringComparison.OrdinalIgnoreCase)) continue;
+                File.Copy(currentExe, target, true);
+            }
+            foreach (string target in targets)
+                if (!string.Equals(expectedHash, ComputeFileSha256(target), StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("Installed executable checksum mismatch: " + target);
+            WriteLog("INSTALL", "Both installed executable copies verified (SHA256=" + expectedHash + ").");
+        }
+
+        internal static bool IsManagedExecutablePath(string executablePath)
+        {
+            if (string.IsNullOrEmpty(executablePath) || !Path.IsPathRooted(executablePath)) return false;
+            string fullPath = Path.GetFullPath(executablePath);
+            return string.Equals(fullPath, Path.GetFullPath(InstalledPrimaryExePath), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(fullPath, Path.GetFullPath(InstalledAliasExePath), StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool IsDaemonCommandLine(string commandLine)
+        {
+            if (string.IsNullOrEmpty(commandLine)) return false;
+            int argumentCount;
+            IntPtr arguments = CommandLineToArgvW(commandLine, out argumentCount);
+            if (arguments == IntPtr.Zero) return false;
+            try
+            {
+                if (argumentCount < 2) return false;
+                string mode = Marshal.PtrToStringUni(Marshal.ReadIntPtr(arguments, IntPtr.Size));
+                return string.Equals(mode, "--daemon", StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(mode, "--daemon-notify", StringComparison.OrdinalIgnoreCase);
+            }
+            finally { LocalFree(arguments); }
+        }
+
+        private static void StopOwnedDaemonsForUpgrade()
+        {
+            int currentPid = Process.GetCurrentProcess().Id;
+            foreach (string name in new string[] { "hwp_popup", "AsideHwpGuard" })
+            {
+                foreach (Process process in Process.GetProcessesByName(name))
                 {
-                    if (!string.Equals(Path.GetFullPath(currentExe), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase))
+                    using (process)
                     {
-                        File.Copy(currentExe, target, true);
+                        if (process.Id == currentPid) continue;
+                        string executablePath;
+                        try { executablePath = process.MainModule.FileName; }
+                        catch { continue; }
+                        if (!IsManagedExecutablePath(executablePath)) continue;
+                        using (ManagementObject processInfo = new ManagementObject("Win32_Process.Handle='" + process.Id + "'"))
+                        {
+                            string commandLine = processInfo["CommandLine"] as string;
+                            if (!IsDaemonCommandLine(commandLine)) continue;
+                        }
+                        WriteLog("INSTALL", "Stopping owned daemon for executable upgrade (PID=" + process.Id + ", path=" + executablePath + ").");
+                        process.Kill();
+                        if (!process.WaitForExit(5000))
+                            throw new IOException("The owned guard daemon could not be stopped for upgrade.");
                     }
                 }
-                catch
-                {
-                    // Ignore if target is currently locked by running daemon
-                }
             }
+            if (IsDaemonRunning())
+                throw new IOException("An unrecognized guard daemon still owns the mutex. Close that guard instance and run setup again; no unknown process was stopped.");
         }
 
         private static void RegisterStartupRun()
@@ -359,6 +433,8 @@ namespace AsideHwpGuard
 
             // 1. Extract embedded FilePathCheckerModuleExample.dll if missing or SHA-256 differs
             byte[] embeddedBytes = GetEmbeddedDllBytes();
+            if (embeddedBytes == null || embeddedBytes.Length == 0)
+                throw new InvalidOperationException("The embedded HWP security module is missing; no module registration was changed.");
             if (embeddedBytes != null && embeddedBytes.Length > 0)
             {
                 string expectedHash = ComputeSha256(embeddedBytes);
@@ -386,7 +462,8 @@ namespace AsideHwpGuard
                 }
             }
 
-            // 2. Repair broken entries and register all 7 standard keys in HKCU (64-bit & WOW6432Node)
+            // 2. Maintain our private registration in HKCU (64-bit & WOW6432Node).
+            // Never repair or overwrite another application's registration.
             UpdateHwpModulesRegistryKey(HwpModulesRegPath);
             UpdateHwpModulesRegistryKey(HwpModulesWow64RegPath);
         }
@@ -395,37 +472,43 @@ namespace AsideHwpGuard
         {
             using (RegistryKey rk = Registry.CurrentUser.CreateSubKey(subKeyPath))
             {
-                if (rk == null) return;
-
-                // Repair any existing broken or temporary (_MEI*, \Temp\) paths
-                string[] existingNames = rk.GetValueNames();
-                foreach (string name in existingNames)
-                {
-                    if (string.IsNullOrEmpty(name)) continue;
-                    string val = rk.GetValue(name) as string;
-                    bool isBroken = string.IsNullOrEmpty(val) ||
-                                    !Path.IsPathRooted(val) ||
-                                    !File.Exists(val) ||
-                                    val.IndexOf("_MEI", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    val.IndexOf("\\Temp\\", StringComparison.OrdinalIgnoreCase) >= 0;
-                    if (isBroken)
-                    {
-                        rk.SetValue(name, PermanentDllPath, RegistryValueKind.String);
-                    }
-                }
-
-                // Register all 7 standard module keys
-                foreach (string keyName in StandardModuleKeys)
-                {
-                    string currentVal = rk.GetValue(keyName) as string;
-                    if (!string.Equals(currentVal, PermanentDllPath, StringComparison.OrdinalIgnoreCase))
-                    {
-                        rk.SetValue(keyName, PermanentDllPath, RegistryValueKind.String);
-                    }
-                }
+                if (rk == null) throw new InvalidOperationException("Cannot open HWP module registrations: " + subKeyPath);
+                int changes = ApplyModuleRegistrations(rk, PermanentDllPath);
+                if (changes > 0)
+                    WriteLog("LAYER1", "Updated " + changes + " owned/missing registrations in HKCU\\" + subKeyPath + "; existing shared and foreign values preserved.");
             }
         }
 
+        // Accept an already-open key so regression tests can use an isolated branch.
+        // Enumerate names only for exact-name existence checks, never to rewrite unknown
+        // entries. A broken foreign DLL may be restored by its own installer.
+        internal static int ApplyModuleRegistrations(RegistryKey key, string modulePath)
+        {
+            if (key == null) throw new ArgumentNullException("key");
+            if (string.IsNullOrEmpty(modulePath) || !Path.IsPathRooted(modulePath) || !File.Exists(modulePath))
+                throw new FileNotFoundException("The guard DLL must exist before registration.", modulePath);
+
+            HashSet<string> existingNames = new HashSet<string>(key.GetValueNames(), StringComparer.OrdinalIgnoreCase);
+            int changes = 0;
+            string ownedValue = key.GetValue(GuardModuleKey, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
+            if (!existingNames.Contains(GuardModuleKey) ||
+                key.GetValueKind(GuardModuleKey) != RegistryValueKind.String ||
+                !string.Equals(ownedValue, modulePath, StringComparison.OrdinalIgnoreCase))
+            {
+                key.SetValue(GuardModuleKey, modulePath, RegistryValueKind.String);
+                changes++;
+            }
+
+            foreach (string alias in CompatibilityModuleKeys)
+            {
+                if (!existingNames.Contains(alias))
+                {
+                    key.SetValue(alias, modulePath, RegistryValueKind.String);
+                    changes++;
+                }
+            }
+            return changes;
+        }
         private static byte[] GetEmbeddedDllBytes()
         {
             Assembly asm = Assembly.GetExecutingAssembly();
@@ -621,6 +704,8 @@ namespace AsideHwpGuard
 
             try
             {
+                _daemonReady = new EventWaitHandle(false, EventResetMode.ManualReset, ReadyEventName);
+                _daemonReady.Reset();
                 Directory.CreateDirectory(BaseDir);
                 Directory.CreateDirectory(ModulesDir);
                 Directory.CreateDirectory(LogsDir);
@@ -648,6 +733,7 @@ namespace AsideHwpGuard
 
                 using (_trayIcon = CreateTrayIcon())
                 {
+                    _daemonReady.Set();
                     if (showBalloonOnStart)
                     {
                         _trayIcon.ShowBalloonTip(
@@ -667,6 +753,12 @@ namespace AsideHwpGuard
             finally
             {
                 _daemonRunning = false;
+                if (_daemonReady != null)
+                {
+                    _daemonReady.Reset();
+                    _daemonReady.Dispose();
+                    _daemonReady = null;
+                }
                 if (_instanceMutex != null)
                 {
                     try { _instanceMutex.ReleaseMutex(); } catch { }
@@ -703,7 +795,7 @@ namespace AsideHwpGuard
                 ni.ShowBalloonTip(
                     3000,
                     "AsideHwpGuard 상태 진단 및 복구 완료",
-                    "Layer 1(DLL/레지스트리 7종), Layer 2(AGENTS.md), Layer 3(실시간 감시) 모두 정상입니다.",
+                    "전용 보안모듈 등록과 AGENTS.md 복구를 완료했습니다. 기존 타 프로그램 등록은 보존했습니다.",
                     ToolTipIcon.Info);
             });
 
@@ -833,6 +925,14 @@ namespace AsideHwpGuard
             }
         }
 
+        internal static bool ShouldScanDesktop(string desktopName)
+        {
+            // auto_pdf owns its isolated conversion and validation desktops. Clicking
+            // there could conceal a broken module or approve an unintended prompt.
+            return !string.IsNullOrEmpty(desktopName) &&
+                   !desktopName.StartsWith("AutoPdf-", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static void ScanAllDesktopsAndApprovePopups(HashSet<uint> hwpPids)
         {
             // Collect desktop names in current WindowStation (includes "Default" and any "exebox-*" desktops)
@@ -842,7 +942,7 @@ namespace AsideHwpGuard
             {
                 EnumDesktops(hwinsta, (deskName, lParam) =>
                 {
-                    if (!string.IsNullOrEmpty(deskName))
+                    if (ShouldScanDesktop(deskName))
                     {
                         desktops.Add(deskName);
                     }
@@ -857,6 +957,7 @@ namespace AsideHwpGuard
 
             foreach (string deskName in desktops)
             {
+                if (!ShouldScanDesktop(deskName)) continue;
                 IntPtr hDesk = OpenDesktop(deskName, 0, false, DESKTOP_ALL_ACCESS);
                 if (hDesk == IntPtr.Zero) continue;
 
@@ -882,6 +983,7 @@ namespace AsideHwpGuard
 
         private static void InspectAndClickWindowIfTarget(IntPtr hWnd, string deskName, HashSet<uint> hwpPids)
         {
+            if (!ShouldScanDesktop(deskName)) return;
             if (!IsWindowVisible(hWnd)) return;
 
             // Avoid duplicate rapid clicks on the same handle within 150ms
@@ -1098,20 +1200,28 @@ namespace AsideHwpGuard
                 Console.WriteLine("   DLL SHA-256        : " + ComputeFileSha256(PermanentDllPath));
             }
 
-            Console.WriteLine("\n2. Registry Modules (HKCU\\" + HwpModulesRegPath + "):");
-            using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(HwpModulesRegPath, false))
+            Console.WriteLine("\n2. Registry Modules (owned key repaired; existing aliases and foreign keys preserved):");
+            foreach (string subKeyPath in new string[] { HwpModulesRegPath, HwpModulesWow64RegPath })
             {
-                if (rk == null)
+                Console.WriteLine("   HKCU\\" + subKeyPath);
+                using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(subKeyPath, false))
                 {
-                    Console.WriteLine("   [MISSING] Registry key does not exist.");
-                }
-                else
-                {
-                    foreach (string key in StandardModuleKeys)
+                    if (rk == null)
+                    {
+                        Console.WriteLine("   [MISSING] Registry key does not exist.");
+                        continue;
+                    }
+                    List<string> keys = new List<string>();
+                    keys.Add(GuardModuleKey);
+                    keys.AddRange(CompatibilityModuleKeys);
+                    keys.Add("AsideHwpSetup_v1");
+                    keys.Add("AutoPdf_FilePathChecker_v1");
+                    foreach (string key in keys)
                     {
                         string val = rk.GetValue(key) as string;
                         bool ok = !string.IsNullOrEmpty(val) && File.Exists(val);
-                        Console.WriteLine(string.Format("   - {0,-28} : {1} ({2})", key, val ?? "<null>", ok ? "OK" : "BROKEN"));
+                        string policy = key == GuardModuleKey ? "OWNED" : "PRESERVED";
+                        Console.WriteLine(string.Format("   - {0,-34} : {1} ({2}; {3})", key, val ?? "<absent/non-string>", ok ? "OK" : "MISSING/BROKEN", policy));
                     }
                 }
             }
@@ -1145,6 +1255,7 @@ namespace AsideHwpGuard
             }
             bool daemonRunning = IsDaemonRunning();
             Console.WriteLine("   Daemon Running     : " + (daemonRunning ? "RUNNING (Active)" : "STOPPED"));
+            Console.WriteLine("   Daemon Ready       : " + IsDaemonReady());
             Console.WriteLine("   Guard Log Path     : " + GuardLogPath);
             return 0;
         }
@@ -1207,7 +1318,8 @@ namespace AsideHwpGuard
             Console.WriteLine("=== AsideHwpGuard (hwp_popup) End-to-End Self-Test ===");
 
             // Ensure installed and daemon running
-            RunInstallAndStartLauncher(false);
+            int setupResult = RunInstallAndStartLauncher(false);
+            if (setupResult != 0) return setupResult;
             Console.WriteLine("[STEP 1] Layer 1, Layer 2, and Background Daemon active: " + IsDaemonRunning());
 
             string testFile = Path.Combine(BaseDir, "e2e_test_sample.hwp");
@@ -1226,7 +1338,7 @@ namespace AsideHwpGuard
                 }
 
                 dynamic hwp1 = Activator.CreateInstance(hwpType);
-                hwp1.RegisterModule("FilePathCheckDLL", "FilePathCheckerModule");
+                hwp1.RegisterModule("FilePathCheckDLL", GuardModuleKey);
                 hwp1.SetMessageBoxMode(0x00020000);
 
                 dynamic act = hwp1.CreateAction("InsertText");
@@ -1305,6 +1417,17 @@ namespace AsideHwpGuard
         // =====================================================================
         // Helpers
         // =====================================================================
+        public static bool IsDaemonReady()
+        {
+            if (!IsDaemonRunning()) return false;
+            try
+            {
+                using (EventWaitHandle ready = EventWaitHandle.OpenExisting(ReadyEventName))
+                    return ready.WaitOne(0);
+            }
+            catch (WaitHandleCannotBeOpenedException) { return false; }
+        }
+
         public static bool IsDaemonRunning()
         {
             bool createdNew;

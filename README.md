@@ -1,59 +1,66 @@
 # hwp_popup (`hwp_popup.exe` / `AsideHwpGuard`)
 
-한컴오피스 한글(HWP/HWPX) COM 오토메이션(`HWPFrame.HwpObject`) 사용 시 발생하는 보안 승인 모달 창(`접근하려는 시도...`)을 **외부 런타임 의존성 없는 단일 실행 파일(`hwp_popup.exe`)** 하나로 영구 해결하는 **3중 방어(3-Layer Hybrid Defense)** 솔루션입니다.
+한글(HWP/HWPX) COM 자동화의 보안 승인창을 처리하는 단일 실행 파일입니다. DLL, 레지스트리 등록, Aside 지침, 팝업 감시를 사용자 계정별로 관리합니다.
 
----
+## 보안모듈 등록과 다른 프로그램의 공존
 
-## 핵심 아키텍처 (3-Layer Defense)
+`1.1.0`부터 각 프로그램이 소유하는 등록명을 분리합니다.
 
-### Layer 1: 보안모듈 DLL 영구 배치 및 레지스트리 7종 전방위 등록 (사전 차단 1)
-- 실행 파일 내부에 한컴 공식 `FilePathCheckerModuleExample.dll`을 리소스로 내장(Embedded Resource)하고 있어 단일 `.exe` 파일만으로 동작합니다.
-- 실행 시 `%LocalAppData%\AsideHwpGuard\modules\FilePathCheckerModuleExample.dll`에 DLL을 추출 및 무결성(SHA-256) 검증합니다.
-- `HKCU\Software\HNC\HwpAutomation\Modules` (및 `WOW6432Node`) 내 깨진 임시 경로(`Temp\_MEI*` 등)를 자동 복구하고, AI 에이전트 및 외부 도구가 사용하는 **7대 표준 모듈 키**를 일괄 등록합니다:
-  - `FilePathCheckerModuleExample`
-  - `FilePathCheckerModule`
-  - `FilePathCheckDLL`
-  - `FilePathCheckDLLModule`
-  - `SecurityModule`
-  - `Automation`
-  - `AsideHwpSetup_v1`
+| 등록명 | hwp_popup 처리 |
+|---|---|
+| `AsideHwpGuard_FilePathChecker_v1` | 전용 등록. 누락·잘못된 경로·자료형을 설치 및 주기 점검 때 복구 |
+| `FilePathCheckerModuleExample`, `FilePathCheckerModule`, `FilePathCheckDLL`, `FilePathCheckDLLModule`, `SecurityModule`, `Automation` | 값이 아예 없을 때만 호환용으로 생성. 기존 값은 경로·자료형과 관계없이 보존 |
+| `AsideHwpSetup_v1`, `AutoPdf_FilePathChecker_v1` 및 나머지 모든 타 도구 등록 | 생성·변경·삭제하지 않음 |
 
-### Layer 2: Aside 전역 지침(`AGENTS.md`) 비파괴 자동 패치 및 실시간 복구 (사전 차단 2)
-- `%USERPROFILE%\.aside\u\*\AGENTS.md` 및 `%ASIDE_HOME%` 내 `AGENTS.md`를 스캔하여 기존 사용자 지침을 보존한 채 `<!-- ASIDE-HWP-GUARD:BEGIN -->` ~ `<!-- ASIDE-HWP-GUARD:END -->` 블록을 멱등성 있게 패치합니다.
-- `FileSystemWatcher` 및 주기적 헬스체크를 통해 지침이 실수로 삭제되더라도 자동 복구합니다.
+- `%LocalAppData%\AsideHwpGuard\modules\FilePathCheckerModuleExample.dll`에 내장 DLL을 추출하고 SHA-256을 검증합니다. 추출에 실패하면 등록을 진행하지 않습니다.
+- `HKCU\Software\HNC\HwpAutomation\Modules`와 `HKCU\Software\WOW6432Node\HNC\HwpAutomation\Modules`에 같은 소유권 정책을 적용합니다.
+- 다른 프로그램의 DLL이 이동하거나 삭제되어도 그 등록을 가로채지 않습니다. 해당 프로그램의 설치·복구 기능으로 고쳐야 합니다.
+- 다른 PC에서는 새 실행 파일을 각 Windows 사용자 계정으로 실행합니다. DLL과 등록 경로는 해당 PC의 `%LocalAppData%`에서 생성하므로 이전 PC의 절대 경로를 복사할 필요가 없습니다.
+- auto_pdf도 전용 `AutoPdf_FilePathChecker_v1`을 쓰는 버전으로 업데이트해야 합니다. 구버전 hwp_popup 데몬이 실행 중인 PC에는 새 hwp_popup도 설치해야 합니다.
 
-### Layer 3: 멀티 데스크톱 Win32 + WPF UIAutomation 실시간 팝업 자동 승인 가드 (최후 방어선)
-- AI가 `RegisterModule` 호출을 누락한 스크립트를 실행하더라도, 백그라운드 데몬이 25ms 주기로 감지하여 `[모두 허용(N)]`(또는 `[접근 허용(Y)]`)을 즉시 무음 승인합니다.
-- 구버전 한글 표준 대화상자(`#32770`)와 최신 한컴오피스 2022+ WPF 메시지박스(`HwndWrapper[hwp.exe;;...]` / `MessageBoxImpl`) 및 샌드박스 데스크톱(`Default` + `exebox-*`)을 모두 지원합니다.
-- 승인 내역은 `%LocalAppData%\AsideHwpGuard\logs\guard.log`에 기록됩니다.
-
----
-
-## 실행 및 CLI 옵션
+새 자동화 코드는 전용 등록명을 사용합니다.
 
 ```powershell
-# 일반 설치 및 백그라운드 가드 실행 (트레이 아이콘 및 안내 표시)
-.\hwp_popup.exe
+$h = New-Object -ComObject HWPFrame.HwpObject
+[void]$h.RegisterModule("FilePathCheckDLL", "AsideHwpGuard_FilePathChecker_v1")
+[void]$h.SetMessageBoxMode(0x00020000)
+```
 
-# 무음 설치 및 백그라운드 가드 즉시 시작
-.\hwp_popup.exe --silent
+```python
+hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
+hwp.RegisterModule("FilePathCheckDLL", "AsideHwpGuard_FilePathChecker_v1")
+hwp.SetMessageBoxMode(0x00020000)
+```
 
-# 현재 설치 상태, DLL 해시, 레지스트리 7개 키, AGENTS.md, 데몬 동작 상태 진단
-.\hwp_popup.exe --status
+## 지침과 팝업 감시
 
-# 자체 E2E 검증 (Case 1: RegisterModule 호출 / Case 2: RegisterModule 누락 시 자동 클릭 검증)
-.\hwp_popup.exe --test
+- `%USERPROFILE%\.aside\u\*\AGENTS.md` 및 `%ASIDE_HOME%`의 관리 마커 블록을 갱신합니다. 블록 밖의 기존 지침은 보존합니다. 생성하는 코드 예제도 전용 등록명을 사용합니다.
+- Win32 및 WPF 한글 보안 대화상자를 감시하고 자동 승인합니다. 기존 `Default`, `exebox-*` 데스크톱 지원은 유지합니다.
+- `AutoPdf-`로 시작하는 전용 데스크톱은 열거나 창을 검사하지 않습니다. auto_pdf의 격리 변환과 보안모듈 검증이 외부 자동 클릭의 영향을 받지 않도록 합니다.
+- 로그: `%LocalAppData%\AsideHwpGuard\logs\guard.log`.
 
-# 데몬 종료, 시작프로그램 해제 및 AGENTS.md 마커 블록 제거
+## 설치와 업데이트
+
+```powershell
+.\hwp_popup.exe            # 설치 및 가드 시작
+.\hwp_popup.exe --silent   # 무음 설치 및 가드 시작
+.\hwp_popup.exe --status   # 두 등록 경로, 소유/보존 정책, DLL 해시, 실행 상태 진단
 .\hwp_popup.exe --uninstall
 ```
 
----
+업데이트할 때 설치 경로의 두 실행 파일이 새 빌드와 다르면, 정확히 해당 설치 경로에서 `--daemon` 또는 `--daemon-notify`로 실행 중인 가드만 종료한 뒤 교체합니다. 두 복사본의 SHA-256 일치와 데몬 시작을 확인해야 설치가 성공합니다. 잠긴 파일 교체를 무시한 채 구버전 데몬을 남기지 않습니다. 설치 경로 밖의 알 수 없는 가드가 실행 중이면 설치를 실패로 표시하므로 그 가드를 종료하고 다시 실행하십시오. 이 업데이트 절차는 한글 프로세스를 종료하지 않습니다.
 
-## 빌드 방법
+제거 시 자동 시작과 지침의 관리 블록을 해제합니다. 기존 DLL과 모듈 등록은 다른 자동화의 참조를 보존하기 위해 남겨 둡니다.
 
-Windows 10/11 기본 내장 `.NET Framework 4.x` 컴파일러(`csc.exe`)를 사용하여 별도 SDK 설치 없이 즉시 빌드됩니다:
+## 빌드와 검증
+
+Windows 기본 `.NET Framework 4.x` 컴파일러를 사용합니다.
 
 ```powershell
 .\build.ps1
+.\test.ps1
 ```
+
+`test.ps1`은 임의의 테스트용 HKCU 분기와 임시 파일만 사용합니다. 32/64비트 레지스트리 보기에서 신규 설치, 정상·손상된 외부 등록 보존, 전용 등록 복구, 경로 이동, 반복 복구, DLL 누락, 데스크톱 제외, 업데이트 대상 식별을 검증합니다. 테스트 후 해당 분기와 임시 파일을 정리하며 한글 COM·설치·실행 중인 데몬은 건드리지 않습니다.
+
+기존 `hwp_popup.exe --test`는 COM과 팝업 자동 승인을 시험하는 수동 E2E 기능입니다. **실행 전후 모든 Hwp 프로세스를 종료하므로, 저장되지 않은 문서가 있는 PC에서는 실행하지 마십시오.** 회귀 검증에는 위의 안전한 `test.ps1`을 사용합니다.
